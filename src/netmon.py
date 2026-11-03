@@ -19,7 +19,7 @@ from tkinter import ttk, messagebox, filedialog
 import netinfo
 
 APP_NAME = "网络监控中心"
-APP_VER = "1.3.1"
+APP_VER = "1.3.2"
 FONT = "Microsoft YaHei UI"
 
 # ---------- 配色（浅色简洁风） ----------
@@ -368,45 +368,23 @@ class App:
                                padx=self.px(18), pady=(self.px(2), self.px(12)))
         self._redraw_tabs()
 
-    # ---------- 页签：抽牌效果 ----------
-    def _round_fill(self, cv, x1, y1, x2, y2, r, color):
-        r = int(min(r, (x2 - x1) / 2, (y2 - y1) / 2))
-        if r < 2:
-            cv.create_rectangle(x1, y1, x2, y2, fill=color, outline=color)
-            return
-        # Tk 角度以 3 点钟方向为 0 度、逆时针为正；每个角取「朝盒心」的那一象限
-        corners = [((x1, y1, x1 + 2 * r, y1 + 2 * r), 90),          # 左上
-                   ((x2 - 2 * r, y1, x2, y1 + 2 * r), 0),           # 右上
-                   ((x2 - 2 * r, y2 - 2 * r, x2, y2), 270),         # 右下
-                   ((x1, y2 - 2 * r, x1 + 2 * r, y2), 180)]         # 左下
-        cv.create_rectangle(x1 + r, y1, x2 - r, y2, fill=color, outline=color)
-        cv.create_rectangle(x1, y1 + r, x2, y2 - r, fill=color, outline=color)
-        for box, start in corners:
-            cv.create_arc(box[0], box[1], box[2], box[3], start=start, extent=90,
-                          style="pieslice", fill=color, outline=color)
-
-    def _round_rect(self, cv, x1, y1, x2, y2, r, fill, outline=None):
-        # 用「描边色底层 + 填充色内层」套出 1px 边线，避免线条接缝处的毛刺
-        if outline and outline != fill:
-            self._round_fill(cv, x1, y1, x2, y2, r, outline)
-            self._round_fill(cv, x1 + 1, y1 + 1, x2 - 1, y2 - 1, max(r - 1, 1), fill)
-        else:
-            self._round_fill(cv, x1, y1, x2, y2, r, fill)
-
+    # ---------- 页签：抽牌效果（尖角，与整体扁平风格一致） ----------
     def _draw_card(self, cv, card, selected):
         x, w = card["x"], card["w"]
         h = self._tabbar_h
-        r = self.px(7)
         hover = self._tab_hover == card["idx"]
+        band = self.px(4)
         if selected:
-            # 抽出的牌：更高、正立、白底，底部压住整叠牌与内容区衔接
+            # 抽出的牌：更高、正立、白底，底部压住基线，与内容区衔接
             y1 = h - self.px(60)
-            self._round_rect(cv, x + 1, y1, x + w - 1, h, r, CARD, "#C7D4E3")
-            band = self.px(5)
-            # 顶部色带：上沿随卡片圆角走，下沿平直
-            self._round_fill(cv, x + 1, y1, x + w - 1, y1 + band + r, r, PRIMARY)
-            cv.create_rectangle(x + 1, y1 + band, x + w - 1, y1 + band + r,
+            cv.create_rectangle(x + 1, y1, x + w - 1, h, fill=CARD, outline="#C3D1E1")
+            # 顶部主色条（整张牌宽） + 左右 1px 竖边
+            cv.create_rectangle(x + 1, y1, x + w - 1, y1 + band,
                                 fill=PRIMARY, outline=PRIMARY)
+            cv.create_line(x + 1, y1, x + 1, h, fill="#C3D1E1")
+            cv.create_line(x + w - 1, y1, x + w - 1, h, fill="#C3D1E1")
+            # 底边不封口，让抽出的牌与下方内容区连成一体
+            cv.create_rectangle(x + 2, h - 1, x + w - 2, h, fill=CARD, outline=CARD)
             cv.create_text(x + w / 2, (y1 + band + h) / 2, text=card["title"],
                            fill=PRIMARY, font=self.fp(15, True))
         else:
@@ -414,8 +392,8 @@ class App:
             lift = self.px(5) if hover else 0
             y1 = h - self.px(28) - lift
             fill = "#DEE7F2" if hover else "#D3DDEA"
-            self._round_rect(cv, x + 2, y1, x + w - 2, h - 2, r, fill, "#B7C7DA")
-            cv.create_text(x + w / 2, (y1 + h - 2) / 2, text=card["title"],
+            cv.create_rectangle(x + 2, y1, x + w - 2, h - 1, fill=fill, outline="#B7C7DA")
+            cv.create_text(x + w / 2, (y1 + h - 1) / 2, text=card["title"],
                            fill="#44566D" if hover else "#6B7B91",
                            font=self.fp(12, hover))
 
