@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox, filedialog
 import netinfo
 
 APP_NAME = "网络监控中心"
-APP_VER = "1.2.0"
+APP_VER = "1.3.0"
 FONT = "Microsoft YaHei UI"
 
 # ---------- 配色（浅色简洁风） ----------
@@ -322,22 +322,71 @@ class App:
 
         body = tk.Frame(self.root, bg=BG)
         body.pack(fill="both", expand=True)
-        self.nb = ttk.Notebook(body)
-        self.nb.pack(fill="both", expand=True, padx=self.px(18), pady=(self.px(12), self.px(12)))
+        self._build_tabbar(body)
 
-        self.tab_ad = tk.Frame(self.nb, bg=BG)
-        self.tab_ip = tk.Frame(self.nb, bg=BG)
-        self.tab_port = tk.Frame(self.nb, bg=BG)
-        self.tab_probe = tk.Frame(self.nb, bg=BG)
-        self.nb.add(self.tab_ad, text="  网卡与 IP  ")
-        self.nb.add(self.tab_ip, text="  IP 连通检测  ")
-        self.nb.add(self.tab_port, text="  端口状态  ")
-        self.nb.add(self.tab_probe, text="  端口探活  ")
+        self.tab_ad = tk.Frame(self._page_holder, bg=BG)
+        self.tab_ip = tk.Frame(self._page_holder, bg=BG)
+        self.tab_port = tk.Frame(self._page_holder, bg=BG)
+        self.tab_probe = tk.Frame(self._page_holder, bg=BG)
+        self._tab_pages = [self.tab_ad, self.tab_ip, self.tab_port, self.tab_probe]
 
         self._build_tab_adapters()
         self._build_tab_ip()
         self._build_tab_ports()
         self._build_tab_probe()
+        self._select_tab(0)
+
+    def _build_tabbar(self, parent):
+        self._tab_idx = -1
+        bar = tk.Frame(parent, bg=BG, height=self.px(52))
+        bar.pack(fill="x", padx=self.px(18))
+        bar.pack_propagate(False)
+
+        self._tab_btns = []
+        titles = ["网卡与 IP", "IP 连通检测", "端口状态", "端口探活"]
+        for i, title in enumerate(titles):
+            holder = tk.Frame(bar, bg=BG, cursor="hand2")
+            holder.pack(side="left", anchor="s", padx=(0, self.px(4)))
+            strip = tk.Frame(holder, bg=BG, height=self.px(3))
+            strip.pack(fill="x", side="top")
+            lbl = tk.Label(holder, text=title, bg=BG, fg=MUTED, font=self.fp(12),
+                           padx=self.px(20), pady=self.px(9), cursor="hand2")
+            lbl.pack(fill="both", expand=True)
+
+            def on_enter(ev, label=lbl, index=i):
+                if self._tab_idx != index:
+                    label.configure(fg=TEXT)
+
+            def on_leave(ev, label=lbl, index=i):
+                if self._tab_idx != index:
+                    label.configure(fg=MUTED)
+
+            for w in (holder, strip, lbl):
+                w.bind("<Button-1>", lambda ev, idx=i: self._select_tab(idx))
+                w.bind("<Enter>", on_enter)
+                w.bind("<Leave>", on_leave)
+            self._tab_btns.append((holder, strip, lbl))
+
+        tk.Frame(parent, bg=LINE, height=1).pack(fill="x", padx=self.px(18))
+        self._page_holder = tk.Frame(parent, bg=BG)
+        self._page_holder.pack(fill="both", expand=True,
+                               padx=self.px(18), pady=(self.px(10), self.px(12)))
+
+    def _select_tab(self, idx):
+        for i, (holder, strip, lbl) in enumerate(self._tab_btns):
+            on = i == idx
+            holder.configure(bg=CARD if on else BG)
+            strip.configure(bg=PRIMARY if on else BG)
+            lbl.configure(bg=CARD if on else BG,
+                          fg=PRIMARY if on else MUTED,
+                          font=self.fp(13, True) if on else self.fp(12),
+                          pady=self.px(12) if on else self.px(9))
+        for i, page in enumerate(self._tab_pages):
+            if i == idx:
+                page.pack(fill="both", expand=True)
+            else:
+                page.pack_forget()
+        self._tab_idx = idx
 
     def _build_header(self):
         head = tk.Frame(self.root, bg=CARD, height=self.px(70))
@@ -493,7 +542,7 @@ class App:
         ttk.Button(r1, text="批量导入…", command=self._bulk_dialog).pack(
             side="left", padx=(self.px(8), 0))
         ttk.Button(r1, text="全部检测",
-                   command=lambda: self._check_ips(self.ip_items)).pack(
+                   command=lambda: self._check_ips(self.ip_items, force_web=True)).pack(
             side="left", padx=(self.px(8), 0))
         ttk.Button(r1, text="删除选中", command=self._del_ip_items).pack(
             side="left", padx=(self.px(8), 0))
@@ -513,9 +562,10 @@ class App:
 
         card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=LINE)
         card.pack(fill="both", expand=True)
-        cols = [("name", "设备名", 195, "w"), ("ip", "IP 地址", 175, "w"),
-                ("state", "状态", 118, "w"), ("ms", "延迟", 92, "e"),
-                ("ts", "最近检测", 108, "w"), ("note", "备注", 235, "w")]
+        cols = [("name", "设备名", 178, "w"), ("ip", "IP 地址", 152, "w"),
+                ("state", "状态", 104, "w"), ("ms", "延迟", 80, "e"),
+                ("web", "Web 可达", 122, "w"),
+                ("ts", "最近检测", 98, "w"), ("note", "备注", 196, "w")]
         self.tv_ip = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
                                   selectmode="extended")
         for key, title, width, anchor in cols:
@@ -531,14 +581,17 @@ class App:
         card.columnconfigure(0, weight=1)
         for i, bg in ((0, CARD), (1, ROW_ALT)):
             self.tv_ip.tag_configure(f"ok{i}", background=bg, foreground=OK)
+            self.tv_ip.tag_configure(f"warn{i}", background=bg, foreground=WARN)
             self.tv_ip.tag_configure(f"bad{i}", background=bg, foreground=ERR)
             self.tv_ip.tag_configure(f"wait{i}", background=bg, foreground=MUTED)
         self.tv_ip.bind("<Double-1>", self._on_ip_double)
         self.tv_ip.bind("<Button-3>", self._ip_menu)
 
-        tk.Label(tab, text="检测方式：ICMP Echo（无需管理员权限），超时 1.2 秒；结果仅表示网络层可达，"
-                           "不代表业务端口可用（端口可用性请用「端口探活」）。",
+        tk.Label(tab, text="状态 = ICMP 网络层可达（1.2 秒超时）；Web 可达 = DNS 解析 → TCP 443 → HTTPS 状态码。",
                  bg=BG, fg=MUTED, font=self.fp(11), anchor="w").pack(fill="x", pady=(self.px(8), 0))
+        tk.Label(tab, text="「仅端口通」= 443 开放但非网页服务；「不可达」= 没有网页，如 8.8.8.8 本身是 DNS 服务器。"
+                           "整行橙色 = 网络层在线但网页打不开。",
+                 bg=BG, fg=MUTED, font=self.fp(11), anchor="w").pack(fill="x", pady=(self.px(2), 0))
 
         self._render_ip_table()
 
@@ -557,7 +610,8 @@ class App:
             return
         self._ip_seq += 1
         item = {"id": self._ip_seq, "name": name or ip, "ip": ip, "note": "",
-                "ok": None, "ms": 0.0, "err": "", "ts": ""}
+                "ok": None, "ms": 0.0, "err": "", "ts": "",
+                "web": None, "web_label": "", "web_detail": "", "web_ts": 0.0}
         self.ip_items.append(item)
         self.var_ip_name.set("")
         self.var_ip_addr.set("")
@@ -590,75 +644,116 @@ class App:
         tv = self.tv_ip
         yv = tv.yview()
         tv.delete(*tv.get_children())
-        online = offline = 0
         for i, it in enumerate(self.ip_items):
             kind, state = self._ip_state(it)
-            if it["ok"] is True:
-                online += 1
-            elif it["ok"] is False:
-                offline += 1
-            tv.insert("", "end", iid=f"ip{it['id']}", tags=(f"{kind}{i % 2}",), values=(
-                it["name"] or it["ip"], it["ip"], state,
-                f"{it['ms']:.1f} ms" if it["ok"] is True else "—",
-                it["ts"] or "—", it["note"]))
-        self.lbl_ip_stat.configure(
-            text=f"在线 {online}   ·   离线 {offline}   ·   共 {len(self.ip_items)}")
+            tv.insert("", "end", iid=f"ip{it['id']}", tags=(f"{kind}{i % 2}",),
+                      values=self._ip_values(it, state))
+        self._update_ip_stat()
         try:
             tv.yview_moveto(yv[0])
         except Exception:
             pass
 
+    def _web_text(self, it):
+        lvl = it.get("web")
+        if not lvl or not it.get("web_ts"):
+            return "○ 待检测"
+        if lvl == "ok":
+            return f"● {it.get('web_label', '')} 可达"
+        if lvl == "tcp":
+            return "◐ 仅端口通"
+        if lvl == "dns":
+            return "○ 解析失败"
+        return "○ 不可达"
+
+    def _ip_values(self, it, state):
+        return (it["name"] or it["ip"], it["ip"], state,
+                f"{it['ms']:.1f} ms" if it["ok"] is True else "—",
+                self._web_text(it), it["ts"] or "—", it["note"])
+
+    def _update_ip_stat(self):
+        online = sum(1 for it in self.ip_items if it["ok"] is True)
+        offline = sum(1 for it in self.ip_items if it["ok"] is False)
+        web_ok = sum(1 for it in self.ip_items
+                     if it.get("web") == "ok" and it.get("web_ts"))
+        self.lbl_ip_stat.configure(
+            text=f"在线 {online}   ·   离线 {offline}   ·   网页可达 {web_ok}   ·   共 {len(self.ip_items)}")
+
     @staticmethod
     def _ip_state(it):
         if it["ok"] is True:
+            if it.get("web_ts") and it.get("web") in ("tcp", "none", "dns"):
+                return "warn", "● 在线"
             return "ok", "● 在线"
         if it["ok"] is False:
             return "bad", "● 离线"
         return "wait", "○ 检测中"
 
-    def _check_ips(self, items):
+    def _check_ips(self, items, force_web=False):
         if not items:
             return
         targets = [(it["id"], it["ip"]) for it in items]
+        now = time.time()
+        web_targets = [(it["id"], it["ip"]) for it in items
+                       if force_web or now - it.get("web_ts", 0) > 55]
+
+        def one_ping(iid, ip):
+            try:
+                ok, ms, err = netinfo.ping_host(ip, 1200)
+            except Exception as exc:
+                ok, ms, err = False, 0.0, str(exc)
+            self.ip_q.put(("ping", iid, ok, ms, err))
+
+        def one_web(iid, ip):
+            try:
+                lvl, label, detail = netinfo.web_check(ip, 443, 2.5)
+            except Exception as exc:
+                lvl, label, detail = "none", "检测异常", str(exc)
+            self.ip_q.put(("web", iid, lvl, label, detail))
 
         def worker():
             from concurrent.futures import ThreadPoolExecutor
-            with ThreadPoolExecutor(max_workers=12) as ex:
-                futures = {ex.submit(netinfo.ping_host, ip, 1200): iid for iid, ip in targets}
-                for fut in futures:
-                    iid = futures[fut]
-                    try:
-                        ok, ms, err = fut.result()
-                    except Exception as exc:
-                        ok, ms, err = False, 0.0, str(exc)
-                    self.ip_q.put((iid, ok, ms, err))
+            with ThreadPoolExecutor(max_workers=16) as ex:
+                for iid, ip in targets:
+                    ex.submit(one_ping, iid, ip)
+                for iid, ip in web_targets:
+                    ex.submit(one_web, iid, ip)
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _drain_ip(self):
-        changed = self.ip_q.qsize() > 0
+        changed = False
         try:
             while True:
-                iid, ok, ms, err = self.ip_q.get_nowait()
-                for it in self.ip_items:
-                    if it["id"] != iid:
-                        continue
+                msg = self.ip_q.get_nowait()
+                kind, iid = msg[0], msg[1]
+                it = next((x for x in self.ip_items if x["id"] == iid), None)
+                if it is None:
+                    continue
+                if kind == "ping":
+                    _, _, ok, ms, err = msg
                     it["ok"], it["ms"], it["err"] = ok, ms, err
                     it["ts"] = time.strftime("%H:%M:%S")
-                    if self.tv_ip.exists(f"ip{iid}"):
-                        idx = self.tv_ip.index(f"ip{iid}")
-                        kind, state = self._ip_state(it)
-                        self.tv_ip.item(f"ip{iid}", tags=(f"{kind}{idx % 2}",), values=(
-                            it["name"] or it["ip"], it["ip"], state,
-                            f"{ms:.1f} ms" if ok else "—", it["ts"], it["note"]))
-                    break
+                else:
+                    _, _, lvl, label, detail = msg
+                    it["web"], it["web_label"] = lvl, label
+                    it["web_detail"] = detail
+                    it["web_ts"] = time.time()
+                self._refresh_ip_row(it)
+                changed = True
         except queue.Empty:
             pass
         if changed:
-            online = sum(1 for it in self.ip_items if it["ok"] is True)
-            offline = sum(1 for it in self.ip_items if it["ok"] is False)
-            self.lbl_ip_stat.configure(
-                text=f"在线 {online}   ·   离线 {offline}   ·   共 {len(self.ip_items)}")
+            self._update_ip_stat()
+
+    def _refresh_ip_row(self, it):
+        tv = self.tv_ip
+        iid = f"ip{it['id']}"
+        if not tv.exists(iid):
+            return
+        idx = tv.index(iid)
+        kind, state = self._ip_state(it)
+        tv.item(iid, tags=(f"{kind}{idx % 2}",), values=self._ip_values(it, state))
 
     def _auto_check_loop(self):
         try:
@@ -684,7 +779,8 @@ class App:
                 continue
             self._ip_seq += 1
             it = {"id": self._ip_seq, "name": name or ip, "ip": ip, "note": note,
-                  "ok": None, "ms": 0.0, "err": "", "ts": ""}
+                  "ok": None, "ms": 0.0, "err": "", "ts": "",
+                  "web": None, "web_label": "", "web_detail": "", "web_ts": 0.0}
             self.ip_items.append(it)
             index[ip] = it
             added += 1
@@ -734,7 +830,8 @@ class App:
             added, updated = self._merge_items(parsed)
             dlg.destroy()
             self._toast(f"导入完成：新增 {added} 条，更新 {updated} 条", "ok")
-            self._check_ips([it for it in self.ip_items if it["ok"] is None])
+            self._check_ips([it for it in self.ip_items
+                             if it["ok"] is None or not it.get("web_ts")])
 
         def load_file():
             path = filedialog.askopenfilename(
@@ -783,7 +880,7 @@ class App:
                 target = it
                 break
         menu = tk.Menu(self.root, tearoff=0, font=self.fp(11))
-        menu.add_command(label="立即检测", command=lambda: self._check_ips([target] if target else []))
+        menu.add_command(label="立即检测", command=lambda: self._check_ips([target] if target else [], force_web=True))
         menu.add_command(label="编辑设备名 / 备注",
                          command=lambda: self._edit_ip_item(target) if target else None)
         menu.add_command(label="复制 IP", command=lambda: self._copy(target["ip"]) if target else None)
@@ -1580,7 +1677,8 @@ class App:
             self._ip_seq = max(self._ip_seq, i + 1)
             self.ip_items.append({"id": i + 1, "name": it.get("name", ""),
                                   "ip": it.get("ip", ""), "note": it.get("note", ""),
-                                  "ok": None, "ms": 0.0, "err": "", "ts": ""})
+                                  "ok": None, "ms": 0.0, "err": "", "ts": "",
+                                  "web": None, "web_label": "", "web_detail": "", "web_ts": 0.0})
 
     def _save_config(self):
         cfg = {"interval": self.interval,

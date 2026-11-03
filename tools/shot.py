@@ -54,7 +54,14 @@ def capture(hwnd, path):
     mdc = gdi32.CreateCompatibleDC(hdc)
     bmp = gdi32.CreateCompatibleBitmap(hdc, w, h)
     gdi32.SelectObject(mdc, bmp)
-    gdi32.BitBlt(mdc, 0, 0, w, h, hdc, r.left, r.top, 0x00CC0020)
+    # 优先用 PrintWindow 直接重绘窗口内容，即使被遮挡/最小化也能取到画面
+    ok = False
+    try:
+        ok = bool(user32.PrintWindow(hwnd, mdc, 2))  # PW_RENDERFULLCONTENT
+    except Exception:
+        ok = False
+    if not ok:
+        gdi32.BitBlt(mdc, 0, 0, w, h, hdc, r.left, r.top, 0x00CC0020)
     bi = BITMAPINFOHEADER()
     bi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
     bi.biWidth = w

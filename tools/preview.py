@@ -11,6 +11,17 @@ root = tk.Tk()
 app = netmon.App(root)
 tab = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
+if tab == 1 and not app.ip_items:
+    demo = [("本机回环", "127.0.0.1", ""), ("内网网关", "10.254.217.254", ""),
+            ("Google DNS", "8.8.8.8", ""), ("阿里 DNS", "223.5.5.5", "")]
+    for i, (n, ip, note) in enumerate(demo, 1):
+        app.ip_items.append({"id": i, "name": n, "ip": ip, "note": note,
+                             "ok": None, "ms": 0.0, "err": "", "ts": "",
+                             "web": None, "web_label": "", "web_detail": "", "web_ts": 0.0})
+    app._ip_seq = len(demo)
+    app._render_ip_table()
+    root.after(1500, lambda: app._check_ips(app.ip_items, force_web=True))
+
 if tab == 2 and not app.probes:
     demo = [("本机 SMB", "127.0.0.1", 445), ("网关 DNS", "192.168.61.254", 53)]
     for i, (n, h, p) in enumerate(demo, 1):
@@ -20,5 +31,5 @@ if tab == 2 and not app.probes:
     app._refresh_probe_table()
     root.after(2000, app._probe_all)
 
-root.after(1200, lambda: app.nb.select(tab))
+root.after(1200, lambda: app._select_tab(tab))
 root.mainloop()

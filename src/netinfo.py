@@ -330,3 +330,52 @@ def is_ip(text):
         return True
     except ValueError:
         return False
+
+
+# ---------------- Web 可达性（DNS -> TCP -> HTTPS） ----------------
+
+def web_check(host, port=443, timeout=2.5):
+    """检测目标是否有网页服务。返回 (level, label, detail)。
+
+    level: ok   拿到 HTTP 状态码（可真打开网页）
+           tcp  443 端口可连但没有 HTTP 响应（DNS 服务器、数据库等非 Web 服务）
+           none 端口不可达（无网页服务 / 被阻断）
+           dns  域名无法解析
+    """
+    host = (host or "").strip()
+    if not host:
+        return "none", "—", "地址为空"
+
+    target = host
+    if not is_ip(host):
+        try:
+            target = socket.gethostbyname(host)
+        except Exception:
+            return "dns", "解析失败", "域名无法解析为 IP"
+
+    sock = None
+    try:
+        sock = socket.create_connection((target, port), timeout=timeout)
+    except Exception as e:
+        return "none", "不可达", f"TCP {port} 连接失败：{type(e).__name__}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    import http.client
+    import ssl
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        conn = http.client.HTTPSConnection(host, port, timeout=max(timeout, 3.0), context=ctx)
+        conn.request("HEAD", "/", headers={"User-Agent": "Mozilla/5.0 NetMonitor"})
+        resp = conn.getresponse()
+        code = resp.status
+        conn.close()
+        return "ok", str(code), f"HTTPS {code}"
+    except Exception:
+        return "tcp", "仅端口通", f"TCP {port} 可连，但未返回 HTTP 响应"
