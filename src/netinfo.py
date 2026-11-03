@@ -3,6 +3,7 @@ import ctypes
 import ctypes.wintypes as wt
 import ipaddress
 import os
+import re
 import socket
 import struct
 import subprocess
@@ -239,3 +240,93 @@ def get_ports(kind="inet"):
             "proc": name_cache.get(pid, "—") if pid else "—",
         })
     return rows
+
+
+# ---------------- ICMP 连通检测 ----------------
+
+class IP_OPTION_INFORMATION(ctypes.Structure):
+    _fields_ = [("Ttl", ctypes.c_ubyte), ("Tos", ctypes.c_ubyte), ("Flags", ctypes.c_ubyte),
+                ("OptionsSize", ctypes.c_ubyte), ("OptionsData", ctypes.c_void_p)]
+
+
+class ICMP_ECHO_REPLY(ctypes.Structure):
+    _fields_ = [("Address", ctypes.c_ulong), ("Status", ctypes.c_ulong),
+                ("RoundTripTime", ctypes.c_ulong), ("DataSize", ctypes.c_ushort),
+                ("Reserved", ctypes.c_ushort), ("Data", ctypes.c_void_p),
+                ("Options", IP_OPTION_INFORMATION)]
+
+
+def _icmp_ping_v4(ip, timeout_ms=1200, payload_size=32):
+    """调用 IcmpSendEcho 探测 IPv4 主机，返回 (通, 延迟ms, 说明)。"""
+    iphlpapi = ctypes.windll.iphlpapi
+    ws2 = ctypes.windll.ws2_32
+    iphlpapi.IcmpCreateFile.restype = ctypes.c_void_p
+    iphlpapi.IcmpSendEcho.restype = ctypes.c_ulong
+    iphlpapi.IcmpCloseHandle.argtypes = [ctypes.c_void_p]
+    ws2.inet_addr.restype = ctypes.c_ulong
+    ws2.inet_addr.argtypes = [ctypes.c_char_p]
+
+    handle = iphlpapi.IcmpCreateFile()
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        return False, 0.0, "ICMP 句柄创建失败"
+    try:
+        addr = ws2.inet_addr(ip.encode("ascii", "ignore"))
+        if addr == 0xFFFFFFFF:
+            return False, 0.0, "IP 地址无效"
+        payload = b"NetMonitorProbe-0123456789abcdef"[:payload_size]
+        reply_size = ctypes.sizeof(ICMP_ECHO_REPLY) + len(payload) + 8
+        reply = ctypes.create_string_buffer(reply_size)
+        ret = iphlpapi.IcmpSendEcho(ctypes.c_void_p(handle), ctypes.c_ulong(addr),
+                                    payload, len(payload), None, reply, reply_size, timeout_ms)
+        if ret == 0:
+            return False, 0.0, "无响应（超时或目标不可达）"
+        r = ctypes.cast(reply, ctypes.POINTER(ICMP_ECHO_REPLY)).contents
+        if r.Status == 0:
+            return True, float(r.RoundTripTime), ""
+        return False, 0.0, f"ICMP 状态码 {r.Status}"
+    finally:
+        iphlpapi.IcmpCloseHandle(ctypes.c_void_p(handle))
+
+
+def _ping_cmd(ip, timeout_ms=1200):
+    """IPv6 或无 ICMP API 时的回退：调用系统 ping。"""
+    args = ["ping", "-n", "1", "-w", str(int(timeout_ms))]
+    if ":" in ip:
+        args.insert(1, "-6")
+    args.append(ip)
+    try:
+        r = subprocess.run(args, capture_output=True, creationflags=0x08000000,
+                           timeout=timeout_ms / 1000.0 + 3)
+    except Exception as e:
+        return False, 0.0, str(e)
+    out = _decode((r.stdout or b"") + (r.stderr or b"")).lower()
+    if r.returncode == 0 and "ttl=" in out:
+        m = re.search(r"(?:时间|time)[=<]\s*(\d+)\s*ms", out)
+        return True, float(m.group(1)) if m else 0.0, ""
+    return False, 0.0, "无响应"
+
+
+def ping_host(host, timeout_ms=1200):
+    """统一探活入口，支持 IP 与主机名。返回 (是否通, 延迟ms, 说明)。"""
+    host = (host or "").strip()
+    if not host:
+        return False, 0.0, "地址为空"
+    ip = host
+    try:
+        ipaddress.ip_address(host.split("%")[0])
+    except ValueError:
+        try:
+            ip = socket.gethostbyname(host)
+        except Exception:
+            return False, 0.0, "无法解析主机名"
+    if ":" not in ip:
+        return _icmp_ping_v4(ip, timeout_ms)
+    return _ping_cmd(ip, timeout_ms)
+
+
+def is_ip(text):
+    try:
+        ipaddress.ip_address((text or "").strip())
+        return True
+    except ValueError:
+        return False

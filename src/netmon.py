@@ -7,17 +7,18 @@ import ctypes
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 
 import netinfo
 
 APP_NAME = "网络监控中心"
-APP_VER = "1.1.0"
+APP_VER = "1.2.0"
 FONT = "Microsoft YaHei UI"
 
 # ---------- 配色（浅色简洁风） ----------
@@ -83,6 +84,35 @@ def fmt_link(bps):
     if bps >= 1e6:
         return f"{bps / 1e6:.0f} Mbps"
     return f"{bps / 1e3:.0f} Kbps"
+
+
+def parse_bulk_text(text):
+    """解析批量导入文本，返回 [(设备名, IP, 备注), ...]。
+
+    支持「设备名,IP」「设备名 IP」「IP」三种写法；逗号/分号/Tab/空格分隔。
+    """
+    items = []
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if re.search(r"[,;\t]", line):
+            parts = [p.strip() for p in re.split(r"[,;\t]+", line) if p.strip()]
+            ip = next((p for p in parts if netinfo.is_ip(p)), "")
+            others = [p for p in parts if p != ip]
+            name = others[0] if others else ""
+            note = " ".join(others[1:]) if len(others) > 1 else ""
+        else:
+            toks = line.split()
+            ip = next((t for t in toks if netinfo.is_ip(t)), "")
+            if not ip:
+                continue
+            idx = toks.index(ip)
+            name = " ".join(toks[:idx])
+            note = " ".join(toks[idx + 1:])
+        if ip:
+            items.append((name, ip, note))
+    return items
 
 
 class Collector(threading.Thread):
@@ -156,6 +186,11 @@ class App:
         self._probe_seq = 0
         self._probing = set()
 
+        self.ip_items = []
+        self._ip_seq = 0
+        self.ip_q = queue.Queue()
+        self.auto_check = True
+
         self.admin = is_admin()
 
         self.root.title(f"{APP_NAME} v{APP_VER}")
@@ -177,6 +212,7 @@ class App:
         self.collector.start()
         self._tick()
         self._auto_probe()
+        self._auto_check_loop()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -290,13 +326,16 @@ class App:
         self.nb.pack(fill="both", expand=True, padx=self.px(18), pady=(self.px(12), self.px(12)))
 
         self.tab_ad = tk.Frame(self.nb, bg=BG)
+        self.tab_ip = tk.Frame(self.nb, bg=BG)
         self.tab_port = tk.Frame(self.nb, bg=BG)
         self.tab_probe = tk.Frame(self.nb, bg=BG)
         self.nb.add(self.tab_ad, text="  网卡与 IP  ")
+        self.nb.add(self.tab_ip, text="  IP 连通检测  ")
         self.nb.add(self.tab_port, text="  端口状态  ")
         self.nb.add(self.tab_probe, text="  端口探活  ")
 
         self._build_tab_adapters()
+        self._build_tab_ip()
         self._build_tab_ports()
         self._build_tab_probe()
 
@@ -308,7 +347,7 @@ class App:
         left = tk.Frame(head, bg=CARD)
         left.pack(side="left", fill="y", padx=self.px(22))
         tk.Label(left, text=APP_NAME, bg=CARD, fg=TEXT, font=self.fp(17, True)).pack(anchor="w", pady=(self.px(12), 0))
-        tk.Label(left, text="适配器 · IP 地址 · 端口 · 跃点数   实时监控",
+        tk.Label(left, text=f"适配器 · IP 连通 · 端口 · 跃点数    实时监控   ·   v{APP_VER}",
                  bg=CARD, fg=MUTED, font=self.fp(11)).pack(anchor="w")
 
         right = tk.Frame(head, bg=CARD)
@@ -429,6 +468,378 @@ class App:
                  anchor="w").pack(fill="x", padx=self.px(16), pady=(self.px(6), self.px(12)))
 
         self._set_metric_enabled(False)
+
+    # --- Tab: IP 连通检测 ---
+    def _build_tab_ip(self):
+        tab = self.tab_ip
+        self.var_auto_check = tk.BooleanVar(value=self.auto_check)
+
+        bar = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+        bar.pack(fill="x", pady=(0, self.px(10)))
+
+        r1 = tk.Frame(bar, bg=CARD)
+        r1.pack(fill="x", padx=self.px(16), pady=(self.px(11), 0))
+        tk.Label(r1, text="设备名", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left")
+        self.var_ip_name = tk.StringVar()
+        ttk.Entry(r1, textvariable=self.var_ip_name, width=15).pack(
+            side="left", padx=(self.px(5), self.px(14)))
+        tk.Label(r1, text="IP 地址", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left")
+        self.var_ip_addr = tk.StringVar()
+        e_ip = ttk.Entry(r1, textvariable=self.var_ip_addr, width=17)
+        e_ip.pack(side="left", padx=(self.px(5), self.px(12)))
+        e_ip.bind("<Return>", lambda ev: self._add_ip_item())
+        ttk.Button(r1, text="添加", style="Primary.TButton",
+                   command=self._add_ip_item).pack(side="left")
+        ttk.Button(r1, text="批量导入…", command=self._bulk_dialog).pack(
+            side="left", padx=(self.px(8), 0))
+        ttk.Button(r1, text="全部检测",
+                   command=lambda: self._check_ips(self.ip_items)).pack(
+            side="left", padx=(self.px(8), 0))
+        ttk.Button(r1, text="删除选中", command=self._del_ip_items).pack(
+            side="left", padx=(self.px(8), 0))
+        ttk.Button(r1, text="清空", command=self._clear_ip_items).pack(
+            side="left", padx=(self.px(8), 0))
+
+        r2 = tk.Frame(bar, bg=CARD)
+        r2.pack(fill="x", padx=self.px(16), pady=(self.px(8), self.px(10)))
+        tk.Checkbutton(r2, text="每 10 秒自动检测", variable=self.var_auto_check, bg=CARD, fg=TEXT,
+                       font=self.fp(12), activebackground=CARD, selectcolor=CARD,
+                       highlightthickness=0, bd=0,
+                       command=self._on_auto_check).pack(side="left")
+        tk.Label(r2, text="双击行可修改设备名/备注，右键更多操作", bg=CARD, fg=MUTED,
+                 font=self.fp(11)).pack(side="left", padx=(self.px(16), 0))
+        self.lbl_ip_stat = tk.Label(r2, text="", bg=CARD, fg=MUTED, font=self.fp(11))
+        self.lbl_ip_stat.pack(side="right")
+
+        card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+        card.pack(fill="both", expand=True)
+        cols = [("name", "设备名", 195, "w"), ("ip", "IP 地址", 175, "w"),
+                ("state", "状态", 118, "w"), ("ms", "延迟", 92, "e"),
+                ("ts", "最近检测", 108, "w"), ("note", "备注", 235, "w")]
+        self.tv_ip = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
+                                  selectmode="extended")
+        for key, title, width, anchor in cols:
+            self.tv_ip.heading(key, text=title, anchor=anchor)
+            self.tv_ip.column(key, width=self.px(width), anchor=anchor,
+                              stretch=(key in ("name", "note")))
+        self.tv_ip.grid(row=0, column=0, sticky="nsew", padx=(1, 0), pady=1)
+        sb = ttk.Scrollbar(card, orient="vertical", command=self.tv_ip.yview,
+                           style="Slim.Vertical.TScrollbar")
+        sb.grid(row=0, column=1, sticky="ns", pady=1, padx=(0, 1))
+        self.tv_ip.configure(yscrollcommand=sb.set)
+        card.rowconfigure(0, weight=1)
+        card.columnconfigure(0, weight=1)
+        for i, bg in ((0, CARD), (1, ROW_ALT)):
+            self.tv_ip.tag_configure(f"ok{i}", background=bg, foreground=OK)
+            self.tv_ip.tag_configure(f"bad{i}", background=bg, foreground=ERR)
+            self.tv_ip.tag_configure(f"wait{i}", background=bg, foreground=MUTED)
+        self.tv_ip.bind("<Double-1>", self._on_ip_double)
+        self.tv_ip.bind("<Button-3>", self._ip_menu)
+
+        tk.Label(tab, text="检测方式：ICMP Echo（无需管理员权限），超时 1.2 秒；结果仅表示网络层可达，"
+                           "不代表业务端口可用（端口可用性请用「端口探活」）。",
+                 bg=BG, fg=MUTED, font=self.fp(11), anchor="w").pack(fill="x", pady=(self.px(8), 0))
+
+        self._render_ip_table()
+
+    # --- IP 检测逻辑 ---
+    def _add_ip_item(self):
+        ip = self.var_ip_addr.get().strip()
+        name = self.var_ip_name.get().strip()
+        if not ip:
+            messagebox.showinfo(APP_NAME, "请输入 IP 地址。")
+            return
+        if not netinfo.is_ip(ip):
+            messagebox.showwarning(APP_NAME, f"“{ip}” 不是合法的 IP 地址。")
+            return
+        if any(it["ip"] == ip for it in self.ip_items):
+            self._toast(f"{ip} 已在列表中", "info")
+            return
+        self._ip_seq += 1
+        item = {"id": self._ip_seq, "name": name or ip, "ip": ip, "note": "",
+                "ok": None, "ms": 0.0, "err": "", "ts": ""}
+        self.ip_items.append(item)
+        self.var_ip_name.set("")
+        self.var_ip_addr.set("")
+        self._render_ip_table()
+        self._save_config()
+        self._check_ips([item])
+
+    def _del_ip_items(self):
+        sel = set(self.tv_ip.selection())
+        if not sel:
+            return
+        self.ip_items = [it for it in self.ip_items if f"ip{it['id']}" not in sel]
+        self._render_ip_table()
+        self._save_config()
+
+    def _clear_ip_items(self):
+        if not self.ip_items:
+            return
+        if messagebox.askyesno(APP_NAME, f"确定清空全部 {len(self.ip_items)} 个 IP 吗？"):
+            self.ip_items = []
+            self._render_ip_table()
+            self._save_config()
+
+    def _on_auto_check(self):
+        self._save_config()
+        if self.var_auto_check.get() and self.ip_items:
+            self._check_ips(self.ip_items)
+
+    def _render_ip_table(self):
+        tv = self.tv_ip
+        yv = tv.yview()
+        tv.delete(*tv.get_children())
+        online = offline = 0
+        for i, it in enumerate(self.ip_items):
+            kind, state = self._ip_state(it)
+            if it["ok"] is True:
+                online += 1
+            elif it["ok"] is False:
+                offline += 1
+            tv.insert("", "end", iid=f"ip{it['id']}", tags=(f"{kind}{i % 2}",), values=(
+                it["name"] or it["ip"], it["ip"], state,
+                f"{it['ms']:.1f} ms" if it["ok"] is True else "—",
+                it["ts"] or "—", it["note"]))
+        self.lbl_ip_stat.configure(
+            text=f"在线 {online}   ·   离线 {offline}   ·   共 {len(self.ip_items)}")
+        try:
+            tv.yview_moveto(yv[0])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _ip_state(it):
+        if it["ok"] is True:
+            return "ok", "● 在线"
+        if it["ok"] is False:
+            return "bad", "● 离线"
+        return "wait", "○ 检测中"
+
+    def _check_ips(self, items):
+        if not items:
+            return
+        targets = [(it["id"], it["ip"]) for it in items]
+
+        def worker():
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=12) as ex:
+                futures = {ex.submit(netinfo.ping_host, ip, 1200): iid for iid, ip in targets}
+                for fut in futures:
+                    iid = futures[fut]
+                    try:
+                        ok, ms, err = fut.result()
+                    except Exception as exc:
+                        ok, ms, err = False, 0.0, str(exc)
+                    self.ip_q.put((iid, ok, ms, err))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _drain_ip(self):
+        changed = self.ip_q.qsize() > 0
+        try:
+            while True:
+                iid, ok, ms, err = self.ip_q.get_nowait()
+                for it in self.ip_items:
+                    if it["id"] != iid:
+                        continue
+                    it["ok"], it["ms"], it["err"] = ok, ms, err
+                    it["ts"] = time.strftime("%H:%M:%S")
+                    if self.tv_ip.exists(f"ip{iid}"):
+                        idx = self.tv_ip.index(f"ip{iid}")
+                        kind, state = self._ip_state(it)
+                        self.tv_ip.item(f"ip{iid}", tags=(f"{kind}{idx % 2}",), values=(
+                            it["name"] or it["ip"], it["ip"], state,
+                            f"{ms:.1f} ms" if ok else "—", it["ts"], it["note"]))
+                    break
+        except queue.Empty:
+            pass
+        if changed:
+            online = sum(1 for it in self.ip_items if it["ok"] is True)
+            offline = sum(1 for it in self.ip_items if it["ok"] is False)
+            self.lbl_ip_stat.configure(
+                text=f"在线 {online}   ·   离线 {offline}   ·   共 {len(self.ip_items)}")
+
+    def _auto_check_loop(self):
+        try:
+            if self.var_auto_check.get() and self.ip_items:
+                self._check_ips(self.ip_items)
+        except Exception:
+            pass
+        self.root.after(10000, self._auto_check_loop)
+
+    def _merge_items(self, parsed):
+        added = updated = 0
+        index = {it["ip"]: it for it in self.ip_items}
+        for name, ip, note in parsed:
+            if not netinfo.is_ip(ip):
+                continue
+            if ip in index:
+                it = index[ip]
+                if name:
+                    it["name"] = name
+                if note:
+                    it["note"] = note
+                updated += 1
+                continue
+            self._ip_seq += 1
+            it = {"id": self._ip_seq, "name": name or ip, "ip": ip, "note": note,
+                  "ok": None, "ms": 0.0, "err": "", "ts": ""}
+            self.ip_items.append(it)
+            index[ip] = it
+            added += 1
+        self._render_ip_table()
+        self._save_config()
+        return added, updated
+
+    def _bulk_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("批量导入 IP")
+        dlg.configure(bg=CARD)
+        dlg.transient(self.root)
+        w, h = self.px(580), self.px(460)
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + max(30, (self.root.winfo_height() - h) // 3)
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+        try:
+            ico = resource_path("icon.ico")
+            if os.path.exists(ico):
+                dlg.iconbitmap(ico)
+        except Exception:
+            pass
+
+        tk.Label(dlg, text="批量导入 IP 地址", bg=CARD, fg=TEXT,
+                 font=self.fp(13, True)).pack(anchor="w", padx=self.px(18), pady=(self.px(14), self.px(4)))
+        tk.Label(dlg, text="每行一条。支持「设备名,IP」「设备名 IP」「IP」；逗号 / 分号 / Tab / 空格均可分隔，\n"
+                           "第三个字段作为备注。重复 IP 只更新设备名，不会重复添加。",
+                 bg=CARD, fg=MUTED, font=self.fp(11), justify="left").pack(anchor="w", padx=self.px(18))
+
+        txt = tk.Text(dlg, height=12, font=self.fp(12), bg="#FBFCFE", fg=TEXT, relief="flat",
+                      highlightthickness=1, highlightbackground=LINE, highlightcolor=PRIMARY,
+                      wrap="none", padx=self.px(8), pady=self.px(6))
+        txt.pack(fill="both", expand=True, padx=self.px(18), pady=(self.px(10), 0))
+        txt.focus_set()
+
+        btns = tk.Frame(dlg, bg=CARD)
+        btns.pack(fill="x", padx=self.px(18), pady=self.px(12))
+        msg = tk.Label(btns, text="", bg=CARD, fg=MUTED, font=self.fp(11))
+        msg.pack(side="left")
+
+        def do_import():
+            parsed = parse_bulk_text(txt.get("1.0", "end"))
+            if not parsed:
+                msg.configure(text="没有解析到有效 IP", fg=ERR)
+                return
+            added, updated = self._merge_items(parsed)
+            dlg.destroy()
+            self._toast(f"导入完成：新增 {added} 条，更新 {updated} 条", "ok")
+            self._check_ips([it for it in self.ip_items if it["ok"] is None])
+
+        def load_file():
+            path = filedialog.askopenfilename(
+                parent=dlg, title="选择 IP 列表文件",
+                filetypes=[("文本/CSV 文件", "*.txt *.csv *.list"), ("所有文件", "*.*")])
+            if not path:
+                return
+            body = ""
+            for enc in ("utf-8-sig", "gbk", "utf-8"):
+                try:
+                    with open(path, "r", encoding=enc) as f:
+                        body = f.read()
+                    break
+                except Exception:
+                    continue
+            if not body:
+                msg.configure(text="文件读取失败", fg=ERR)
+                return
+            txt.delete("1.0", "end")
+            txt.insert("1.0", body)
+            msg.configure(text=f"已载入 {os.path.basename(path)}，确认后点“导入”", fg=MUTED)
+
+        ttk.Button(btns, text="导入", style="Primary.TButton", command=do_import).pack(side="right")
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right", padx=(0, self.px(8)))
+        ttk.Button(btns, text="从文件读取…", command=load_file).pack(side="right", padx=(0, self.px(8)))
+        dlg.grab_set()
+
+    def _on_ip_double(self, event):
+        iid = self.tv_ip.identify_row(event.y)
+        if not iid:
+            return
+        for it in self.ip_items:
+            if f"ip{it['id']}" == iid:
+                self._edit_ip_item(it)
+                return
+
+    def _ip_menu(self, event):
+        iid = self.tv_ip.identify_row(event.y)
+        if not iid:
+            return
+        if iid not in self.tv_ip.selection():
+            self.tv_ip.selection_set(iid)
+        target = None
+        for it in self.ip_items:
+            if f"ip{it['id']}" == iid:
+                target = it
+                break
+        menu = tk.Menu(self.root, tearoff=0, font=self.fp(11))
+        menu.add_command(label="立即检测", command=lambda: self._check_ips([target] if target else []))
+        menu.add_command(label="编辑设备名 / 备注",
+                         command=lambda: self._edit_ip_item(target) if target else None)
+        menu.add_command(label="复制 IP", command=lambda: self._copy(target["ip"]) if target else None)
+        menu.add_separator()
+        menu.add_command(label="删除", command=self._del_ip_items)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _edit_ip_item(self, item):
+        if not item:
+            return
+        dlg = tk.Toplevel(self.root)
+        dlg.title("编辑设备信息")
+        dlg.configure(bg=CARD)
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        w, h = self.px(420), self.px(240)
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+        tk.Label(dlg, text="编辑设备信息", bg=CARD, fg=TEXT,
+                 font=self.fp(13, True)).pack(anchor="w", padx=self.px(18), pady=(self.px(14), self.px(8)))
+        body = tk.Frame(dlg, bg=CARD)
+        body.pack(fill="x", padx=self.px(18))
+
+        tk.Label(body, text="IP 地址", bg=CARD, fg=MUTED, font=self.fp(11)).grid(
+            row=0, column=0, sticky="w", pady=self.px(4))
+        tk.Label(body, text=item["ip"], bg=CARD, fg=TEXT, font=self.fp(12, True)).grid(
+            row=0, column=1, sticky="w", padx=self.px(10), pady=self.px(4))
+
+        tk.Label(body, text="设备名", bg=CARD, fg=MUTED, font=self.fp(11)).grid(
+            row=1, column=0, sticky="w", pady=self.px(4))
+        var_name = tk.StringVar(value=item["name"])
+        ttk.Entry(body, textvariable=var_name, width=28).grid(
+            row=1, column=1, sticky="w", padx=self.px(10), pady=self.px(4))
+
+        tk.Label(body, text="备注", bg=CARD, fg=MUTED, font=self.fp(11)).grid(
+            row=2, column=0, sticky="w", pady=self.px(4))
+        var_note = tk.StringVar(value=item["note"])
+        ttk.Entry(body, textvariable=var_note, width=28).grid(
+            row=2, column=1, sticky="w", padx=self.px(10), pady=self.px(4))
+
+        btns = tk.Frame(dlg, bg=CARD)
+        btns.pack(fill="x", padx=self.px(18), pady=self.px(16))
+
+        def save():
+            item["name"] = var_name.get().strip() or item["ip"]
+            item["note"] = var_note.get().strip()
+            self._render_ip_table()
+            self._save_config()
+            dlg.destroy()
+
+        ttk.Button(btns, text="保存", style="Primary.TButton", command=save).pack(side="right")
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right", padx=(0, self.px(8)))
+        dlg.grab_set()
 
     # --- Tab2 端口 ---
     def _build_tab_ports(self):
@@ -559,6 +970,7 @@ class App:
         except queue.Empty:
             pass
         self._drain_probe()
+        self._drain_ip()
         self.root.after(130, self._tick)
 
     def _report_error(self, msg):
@@ -1163,9 +1575,19 @@ class App:
                                 "port": int(p.get("port", 0)), "ok": None, "ms": 0.0,
                                 "err": "", "ts": ""})
 
+        self.auto_check = bool(self._cfg.get("ip_auto_check", True))
+        for i, it in enumerate(self._cfg.get("ip_list", [])):
+            self._ip_seq = max(self._ip_seq, i + 1)
+            self.ip_items.append({"id": i + 1, "name": it.get("name", ""),
+                                  "ip": it.get("ip", ""), "note": it.get("note", ""),
+                                  "ok": None, "ms": 0.0, "err": "", "ts": ""})
+
     def _save_config(self):
         cfg = {"interval": self.interval,
                "switch": self.switch_cfg,
+               "ip_auto_check": bool(self.var_auto_check.get()) if hasattr(self, "var_auto_check") else self.auto_check,
+               "ip_list": [{"name": it["name"], "ip": it["ip"], "note": it["note"]}
+                           for it in self.ip_items],
                "probes": [{"name": p["name"], "host": p["host"], "port": p["port"]} for p in self.probes]}
         try:
             with open(config_path(), "w", encoding="utf-8") as f:
