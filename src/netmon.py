@@ -13,12 +13,13 @@ import sys
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
 import netinfo
 
 APP_NAME = "网络监控中心"
-APP_VER = "1.3.0"
+APP_VER = "1.3.1"
 FONT = "Microsoft YaHei UI"
 
 # ---------- 配色（浅色简洁风） ----------
@@ -338,55 +339,131 @@ class App:
 
     def _build_tabbar(self, parent):
         self._tab_idx = -1
-        bar = tk.Frame(parent, bg=BG, height=self.px(52))
-        bar.pack(fill="x", padx=self.px(18))
-        bar.pack_propagate(False)
-
-        self._tab_btns = []
+        self._tab_hover = -1
         titles = ["网卡与 IP", "IP 连通检测", "端口状态", "端口探活"]
+
+        self._tabbar_h = self.px(68)
+        cv = tk.Canvas(parent, bg=BG, height=self._tabbar_h, highlightthickness=0,
+                       bd=0, cursor="hand2")
+        cv.pack(fill="x", padx=self.px(18))
+        self._tabbar = cv
+
+        f_big = tkfont.Font(font=self.fp(15, True))
+        gap = self.px(3)
+        self._tab_cards = []
+        x = 0
         for i, title in enumerate(titles):
-            holder = tk.Frame(bar, bg=BG, cursor="hand2")
-            holder.pack(side="left", anchor="s", padx=(0, self.px(4)))
-            strip = tk.Frame(holder, bg=BG, height=self.px(3))
-            strip.pack(fill="x", side="top")
-            lbl = tk.Label(holder, text=title, bg=BG, fg=MUTED, font=self.fp(12),
-                           padx=self.px(20), pady=self.px(9), cursor="hand2")
-            lbl.pack(fill="both", expand=True)
+            w = f_big.measure(title) + self.px(46)
+            self._tab_cards.append({"idx": i, "x": x, "w": w, "title": title})
+            x += w + gap
+        self._tabbar_end = x
 
-            def on_enter(ev, label=lbl, index=i):
-                if self._tab_idx != index:
-                    label.configure(fg=TEXT)
+        cv.bind("<Button-1>", self._on_tab_click)
+        cv.bind("<Motion>", self._on_tab_motion)
+        cv.bind("<Leave>", lambda e: self._set_tab_hover(-1))
+        cv.bind("<Configure>", lambda e: self._redraw_tabs())
 
-            def on_leave(ev, label=lbl, index=i):
-                if self._tab_idx != index:
-                    label.configure(fg=MUTED)
-
-            for w in (holder, strip, lbl):
-                w.bind("<Button-1>", lambda ev, idx=i: self._select_tab(idx))
-                w.bind("<Enter>", on_enter)
-                w.bind("<Leave>", on_leave)
-            self._tab_btns.append((holder, strip, lbl))
-
-        tk.Frame(parent, bg=LINE, height=1).pack(fill="x", padx=self.px(18))
         self._page_holder = tk.Frame(parent, bg=BG)
         self._page_holder.pack(fill="both", expand=True,
-                               padx=self.px(18), pady=(self.px(10), self.px(12)))
+                               padx=self.px(18), pady=(self.px(2), self.px(12)))
+        self._redraw_tabs()
+
+    # ---------- 页签：抽牌效果 ----------
+    def _round_fill(self, cv, x1, y1, x2, y2, r, color):
+        r = int(min(r, (x2 - x1) / 2, (y2 - y1) / 2))
+        if r < 2:
+            cv.create_rectangle(x1, y1, x2, y2, fill=color, outline=color)
+            return
+        # Tk 角度以 3 点钟方向为 0 度、逆时针为正；每个角取「朝盒心」的那一象限
+        corners = [((x1, y1, x1 + 2 * r, y1 + 2 * r), 90),          # 左上
+                   ((x2 - 2 * r, y1, x2, y1 + 2 * r), 0),           # 右上
+                   ((x2 - 2 * r, y2 - 2 * r, x2, y2), 270),         # 右下
+                   ((x1, y2 - 2 * r, x1 + 2 * r, y2), 180)]         # 左下
+        cv.create_rectangle(x1 + r, y1, x2 - r, y2, fill=color, outline=color)
+        cv.create_rectangle(x1, y1 + r, x2, y2 - r, fill=color, outline=color)
+        for box, start in corners:
+            cv.create_arc(box[0], box[1], box[2], box[3], start=start, extent=90,
+                          style="pieslice", fill=color, outline=color)
+
+    def _round_rect(self, cv, x1, y1, x2, y2, r, fill, outline=None):
+        # 用「描边色底层 + 填充色内层」套出 1px 边线，避免线条接缝处的毛刺
+        if outline and outline != fill:
+            self._round_fill(cv, x1, y1, x2, y2, r, outline)
+            self._round_fill(cv, x1 + 1, y1 + 1, x2 - 1, y2 - 1, max(r - 1, 1), fill)
+        else:
+            self._round_fill(cv, x1, y1, x2, y2, r, fill)
+
+    def _draw_card(self, cv, card, selected):
+        x, w = card["x"], card["w"]
+        h = self._tabbar_h
+        r = self.px(7)
+        hover = self._tab_hover == card["idx"]
+        if selected:
+            # 抽出的牌：更高、正立、白底，底部压住整叠牌与内容区衔接
+            y1 = h - self.px(60)
+            self._round_rect(cv, x + 1, y1, x + w - 1, h, r, CARD, "#C7D4E3")
+            band = self.px(5)
+            # 顶部色带：上沿随卡片圆角走，下沿平直
+            self._round_fill(cv, x + 1, y1, x + w - 1, y1 + band + r, r, PRIMARY)
+            cv.create_rectangle(x + 1, y1 + band, x + w - 1, y1 + band + r,
+                                fill=PRIMARY, outline=PRIMARY)
+            cv.create_text(x + w / 2, (y1 + band + h) / 2, text=card["title"],
+                           fill=PRIMARY, font=self.fp(15, True))
+        else:
+            # 未抽出的牌：矮一截沉在下面，悬停时向上抽起一点
+            lift = self.px(5) if hover else 0
+            y1 = h - self.px(28) - lift
+            fill = "#DEE7F2" if hover else "#D3DDEA"
+            self._round_rect(cv, x + 2, y1, x + w - 2, h - 2, r, fill, "#B7C7DA")
+            cv.create_text(x + w / 2, (y1 + h - 2) / 2, text=card["title"],
+                           fill="#44566D" if hover else "#6B7B91",
+                           font=self.fp(12, hover))
+
+    def _redraw_tabs(self):
+        cv = self._tabbar
+        if not cv.winfo_exists():
+            return
+        cv.delete("all")
+        w = cv.winfo_width()
+        h = self._tabbar_h
+        if w <= 1:
+            return
+        cv.create_line(0, h - 1, w, h - 1, fill=LINE)
+        for card in self._tab_cards:
+            if card["idx"] != self._tab_idx:
+                self._draw_card(cv, card, False)
+        if 0 <= self._tab_idx < len(self._tab_cards):
+            self._draw_card(cv, self._tab_cards[self._tab_idx], True)
+
+    def _tab_hit(self, x):
+        for card in self._tab_cards:
+            if card["x"] <= x < card["x"] + card["w"]:
+                return card["idx"]
+        return -1
+
+    def _on_tab_click(self, ev):
+        idx = self._tab_hit(ev.x)
+        if idx >= 0:
+            self._select_tab(idx)
+
+    def _on_tab_motion(self, ev):
+        self._set_tab_hover(self._tab_hit(ev.x))
+
+    def _set_tab_hover(self, idx):
+        if idx != self._tab_hover:
+            self._tab_hover = idx
+            self._redraw_tabs()
 
     def _select_tab(self, idx):
-        for i, (holder, strip, lbl) in enumerate(self._tab_btns):
-            on = i == idx
-            holder.configure(bg=CARD if on else BG)
-            strip.configure(bg=PRIMARY if on else BG)
-            lbl.configure(bg=CARD if on else BG,
-                          fg=PRIMARY if on else MUTED,
-                          font=self.fp(13, True) if on else self.fp(12),
-                          pady=self.px(12) if on else self.px(9))
+        if idx == self._tab_idx:
+            return
+        self._tab_idx = idx
         for i, page in enumerate(self._tab_pages):
             if i == idx:
                 page.pack(fill="both", expand=True)
             else:
                 page.pack_forget()
-        self._tab_idx = idx
+        self._redraw_tabs()
 
     def _build_header(self):
         head = tk.Frame(self.root, bg=CARD, height=self.px(70))
@@ -562,10 +639,12 @@ class App:
 
         card = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=LINE)
         card.pack(fill="both", expand=True)
-        cols = [("name", "设备名", 178, "w"), ("ip", "IP 地址", 152, "w"),
-                ("state", "状态", 104, "w"), ("ms", "延迟", 80, "e"),
-                ("web", "Web 可达", 122, "w"),
-                ("ts", "最近检测", 98, "w"), ("note", "备注", 196, "w")]
+        cols = [("name", "设备名", 168, "w"), ("ip", "IP 地址", 142, "w"),
+                ("state", "状态", 100, "w"), ("ms", "延迟", 82, "e"),
+                ("gap1", "", 28, "center"),
+                ("web", "Web 可达", 128, "w"),
+                ("gap2", "", 22, "center"),
+                ("ts", "最近检测", 96, "w"), ("note", "备注", 160, "w")]
         self.tv_ip = ttk.Treeview(card, columns=[c[0] for c in cols], show="headings",
                                   selectmode="extended")
         for key, title, width, anchor in cols:
@@ -669,7 +748,8 @@ class App:
     def _ip_values(self, it, state):
         return (it["name"] or it["ip"], it["ip"], state,
                 f"{it['ms']:.1f} ms" if it["ok"] is True else "—",
-                self._web_text(it), it["ts"] or "—", it["note"])
+                "", self._web_text(it), "",
+                it["ts"] or "—", it["note"])
 
     def _update_ip_stat(self):
         online = sum(1 for it in self.ip_items if it["ok"] is True)
