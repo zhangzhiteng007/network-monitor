@@ -12,7 +12,7 @@ app = netmon.App(root)
 tab = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 
 if tab == 1 and not app.ip_items:
-    demo = [("本机回环", "127.0.0.1", ""), ("内网网关", "10.254.217.254", ""),
+    demo = [("本机回环", "127.0.0.1", ""), ("示例网关", "192.0.2.1", ""),
             ("Google DNS", "8.8.8.8", ""), ("阿里 DNS", "223.5.5.5", "")]
     for i, (n, ip, note) in enumerate(demo, 1):
         app.ip_items.append({"id": i, "name": n, "ip": ip, "note": note,
@@ -23,7 +23,7 @@ if tab == 1 and not app.ip_items:
     root.after(1500, lambda: app._check_ips(app.ip_items, force_web=True))
 
 if tab == 2 and not app.probes:
-    demo = [("本机 SMB", "127.0.0.1", 445), ("网关 DNS", "192.168.61.254", 53)]
+    demo = [("本机 SMB", "127.0.0.1", 445), ("示例 DNS", "192.0.2.2", 53)]
     for i, (n, h, p) in enumerate(demo, 1):
         app.probes.append({"id": i, "name": n, "host": h, "port": p,
                            "ok": None, "ms": 0.0, "err": "", "ts": ""})

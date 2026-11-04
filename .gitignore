@@ -7,6 +7,18 @@ dist/archive/
 dist/config.json
 *.spec
 
+# 运行时配置（含本机网络信息，不入库）
+config.json
+
+# 编辑器 / 工作区
+.workbuddy/
+.vscode/
+.idea/
+
 # 临时文件
-*.png
 *.tmp
+*.log
+
+# 截图默认忽略，但允许文档用图
+*.png
+!docs/*.png

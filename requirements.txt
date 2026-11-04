@@ -1,0 +1,5 @@
+# 运行依赖
+psutil>=5.9
+
+# 构建依赖（打包 exe 时才需要）
+pyinstaller>=6.0

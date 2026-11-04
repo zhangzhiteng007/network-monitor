@@ -1718,8 +1718,9 @@ class App:
         except Exception:
             pass
         self.interval = float(self._cfg.get("interval", 2))
-        self.switch_cfg = {"lan_ip": "10.254.217.87", "lan_name": "以太网 8",
-                           "wan_name": "WLAN", "low": 10, "high": 100}
+        # 默认留空：按「10.x 网段 + 无线网卡特征」自动识别，用户可在 config.json 的 switch 段指定
+        self.switch_cfg = {"lan_ip": "", "lan_name": "", "wan_name": "",
+                           "low": 10, "high": 100}
         user_switch = self._cfg.get("switch", {})
         if isinstance(user_switch, dict):
             self.switch_cfg.update(user_switch)
