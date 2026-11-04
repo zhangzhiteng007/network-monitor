@@ -17,9 +17,10 @@ import tkinter.font as tkfont
 from tkinter import ttk, messagebox, filedialog
 
 import netinfo
+from traffic import TrafficStore, ALL_NIC
 
 APP_NAME = "网络监控中心"
-APP_VER = "1.3.2"
+APP_VER = "1.4.0"
 FONT = "Microsoft YaHei UI"
 
 # ---------- 配色（浅色简洁风） ----------
@@ -62,6 +63,11 @@ def config_path():
         return os.path.join(fallback, "config.json")
 
 
+def traffic_path():
+    """流量历史与 config.json 放在同一可写目录。"""
+    return os.path.join(os.path.dirname(config_path()), "traffic_history.json")
+
+
 def is_admin():
     try:
         return bool(ctypes.windll.shell32.IsUserAnAdmin())
@@ -85,6 +91,16 @@ def fmt_link(bps):
     if bps >= 1e6:
         return f"{bps / 1e6:.0f} Mbps"
     return f"{bps / 1e3:.0f} Kbps"
+
+
+def fmt_bytes(v):
+    if v >= 1073741824:
+        return f"{v / 1073741824:.2f} GB"
+    if v >= 1048576:
+        return f"{v / 1048576:.1f} MB"
+    if v >= 1024:
+        return f"{v / 1024:.0f} KB"
+    return f"{v:.0f} B"
 
 
 def parse_bulk_text(text):
@@ -114,6 +130,362 @@ def parse_bulk_text(text):
         if ip:
             items.append((name, ip, note))
     return items
+
+
+# ---------- 流量统计面板 ----------
+RANGE_LABELS = ["最近 5 分钟", "最近 15 分钟", "最近 1 小时", "最近 6 小时",
+                "最近 24 小时", "今日", "自定义时段"]
+RANGE_SEC = {"最近 5 分钟": 300, "最近 15 分钟": 900, "最近 1 小时": 3600,
+             "最近 6 小时": 21600, "最近 24 小时": 86400}
+DOWN_COLOR = "#0F766E"
+UP_COLOR = "#D97706"
+DOWN_FILL = "#DCF1ED"
+UP_FILL = "#FCEFD9"
+
+
+def _nice_rate(v):
+    """取略大于峰值的整齐刻度（1024 进制）。"""
+    import math
+    if v <= 0:
+        return 1024.0
+    p = 1024 ** max(0, int(math.floor(math.log(v, 1024))))
+    for m in (1, 1.5, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96):
+        if v <= m * p:
+            return float(m * p)
+    return float(128 * p)
+
+
+def _parse_dt(text):
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            tm = time.strptime(text.strip(), fmt)
+            if fmt == "%m-%d %H:%M":
+                now = time.localtime()
+                tm = tm.__class__((now.tm_year,) + tuple(tm)[1:])
+            return time.mktime(tm)
+        except Exception:
+            continue
+    return None
+
+
+class TrafficPanel:
+    """可嵌入页签或独立窗口的流量统计面板：网卡 + 时段 + 汇总 + 双线面积图。"""
+
+    def __init__(self, parent, app, height=168, zoom=False):
+        self.app = app
+        self.store = app.traffic
+        self.height = height
+        self.zoom = zoom
+        self.fp, self.px = app.fp, app.px
+        self.nic_var = tk.StringVar(value="全部网卡（合计）")
+        self.range_var = tk.StringVar(value="最近 1 小时")
+        self.var_start = tk.StringVar()
+        self.var_end = tk.StringVar()
+        self.follow_var = tk.BooleanVar(value=not zoom)
+        self.expanded = True
+        self._last = None
+        self._plot = None
+        self._nic_sig = None
+        self._last_refresh = 0.0
+        self._init_custom()
+
+        outer = tk.Frame(parent, bg=CARD, highlightthickness=1, highlightbackground=LINE)
+        outer.pack(fill="both" if zoom else "x", expand=zoom,
+                   pady=(0 if zoom else self.px(10), 0))
+        self.outer = outer
+
+        head = tk.Frame(outer, bg=CARD)
+        head.pack(fill="x", padx=self.px(16), pady=(self.px(10), 0))
+        tk.Label(head, text="网卡流量统计", bg=CARD, fg=TEXT,
+                 font=self.fp(12, True)).pack(side="left")
+
+        ttk.Button(head, text="放大", width=6, command=self._open_zoom).pack(side="right")
+        self.btn_fold = ttk.Button(head, text="收起", width=6, command=self._toggle_fold)
+        self.btn_fold.pack(side="right", padx=(0, self.px(8)))
+        ttk.Button(head, text="导出 CSV", command=self._export).pack(side="right", padx=(0, self.px(8)))
+        ttk.Button(head, text="清空历史", command=self._clear).pack(side="right", padx=(0, self.px(8)))
+        ttk.Button(head, text="刷新", width=6, command=lambda: self.refresh(True)).pack(
+            side="right", padx=(0, self.px(8)))
+
+        # 第二行：网卡、时段、自定义输入
+        ctl = tk.Frame(outer, bg=CARD)
+        ctl.pack(fill="x", padx=self.px(16), pady=(self.px(8), 0))
+        tk.Label(ctl, text="网卡", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left")
+        self.cb_nic = ttk.Combobox(ctl, textvariable=self.nic_var, width=19, state="readonly")
+        self.cb_nic.pack(side="left", padx=(self.px(6), self.px(16)))
+        self.cb_nic.bind("<<ComboboxSelected>>", self._on_nic_pick)
+
+        tk.Label(ctl, text="时段", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left")
+        cb_range = ttk.Combobox(ctl, textvariable=self.range_var, values=RANGE_LABELS,
+                                width=12, state="readonly")
+        cb_range.pack(side="left", padx=(self.px(6), 0))
+        cb_range.bind("<<ComboboxSelected>>", self._on_range_pick)
+
+        self.custom_box = tk.Frame(ctl, bg=CARD)
+        tk.Label(self.custom_box, text="从", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left", padx=(self.px(10), 0))
+        ttk.Entry(self.custom_box, textvariable=self.var_start, width=17).pack(side="left", padx=(self.px(5), 0))
+        tk.Label(self.custom_box, text="到", bg=CARD, fg=MUTED, font=self.fp(11)).pack(side="left", padx=(self.px(8), 0))
+        ttk.Entry(self.custom_box, textvariable=self.var_end, width=17).pack(side="left", padx=(self.px(5), 0))
+        ttk.Button(self.custom_box, text="应用", width=5,
+                   command=lambda: self.refresh(True)).pack(side="left", padx=(self.px(6), 0))
+        tk.Checkbutton(ctl, text="跟随列表选中网卡", variable=self.follow_var, bg=CARD, fg=MUTED,
+                       font=self.fp(11), activebackground=CARD, selectcolor=CARD,
+                       highlightthickness=0, bd=0).pack(side="right")
+        if self.range_var.get() == "自定义时段":
+            self.custom_box.pack(side="left")
+
+        self.body = tk.Frame(outer, bg=CARD)
+        self.body.pack(fill="both", expand=zoom)
+
+        stat = tk.Frame(self.body, bg=CARD)
+        stat.pack(fill="x", padx=self.px(16), pady=(self.px(10), 0))
+        self.stats = {}
+        for key, title in (("dl", "总下载"), ("ul", "总上传"),
+                           ("pd", "峰值下行"), ("pu", "峰值上行"),
+                           ("ad", "平均下行"), ("au", "平均上行")):
+            cell = tk.Frame(stat, bg=ROW_ALT, highlightthickness=1, highlightbackground=LINE)
+            cell.pack(side="left", padx=(0, self.px(8)))
+            tk.Label(cell, text=title, bg=ROW_ALT, fg=MUTED, font=self.fp(10)).pack(
+                anchor="w", padx=self.px(9), pady=(self.px(5), 0))
+            lab = tk.Label(cell, text="—", bg=ROW_ALT, fg=TEXT, font=self.fp(12, True))
+            lab.pack(anchor="w", padx=self.px(9), pady=(0, self.px(5)))
+            self.stats[key] = lab
+
+        chart_wrap = tk.Frame(self.body, bg=CARD)
+        chart_wrap.pack(fill="both", expand=zoom, padx=self.px(16), pady=(self.px(8), 0))
+        self.cv = tk.Canvas(chart_wrap, bg="#FBFCFE", height=self.height,
+                            highlightthickness=1, highlightbackground=LINE, cursor="crosshair")
+        self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<Configure>", lambda e: self._draw())
+        self.cv.bind("<Motion>", self._on_motion)
+        self.cv.bind("<Leave>", lambda e: self.cv.delete("hover"))
+
+        tk.Label(self.body, text="↓ 下行（接收）    ↑ 上行（发送）    ·    数据来自网卡累计字节计数器，"
+                                 "保存在程序同目录 traffic_history.json，最长保留 24 小时",
+                 bg=CARD, fg=MUTED, font=self.fp(10), anchor="w").pack(
+                     fill="x", padx=self.px(16), pady=(self.px(5), self.px(10)))
+
+        self._refresh_nics()
+        self.refresh(True)
+
+    def _init_custom(self):
+        now = time.time()
+        self.var_start.set(time.strftime("%Y-%m-%d %H:%M", time.localtime(now - 3600)))
+        self.var_end.set(time.strftime("%Y-%m-%d %H:%M", time.localtime(now)))
+
+    # ---------- 交互 ----------
+    def _on_nic_pick(self, _ev=None):
+        self.follow_var.set(False)
+        self.refresh(True)
+
+    def _on_range_pick(self, _ev=None):
+        if self.range_var.get() == "自定义时段":
+            self._init_custom()
+            self.custom_box.pack(side="left")
+        else:
+            self.custom_box.pack_forget()
+        self.refresh(True)
+
+    def _toggle_fold(self):
+        self.expanded = not self.expanded
+        if self.expanded:
+            self.body.pack(fill="both", expand=self.zoom)
+            self.btn_fold.configure(text="收起")
+        else:
+            self.body.pack_forget()
+            self.btn_fold.configure(text="展开")
+        if self.expanded:
+            self.refresh(True)
+
+    def _open_zoom(self):
+        self.app.open_traffic_zoom()
+
+    def follow_adapter(self, name):
+        if not self.follow_var.get() or not name or not self.cb_nic.winfo_exists():
+            return
+        vals = list(self.cb_nic["values"])
+        if name in vals:
+            self.nic_var.set(name)
+            self.refresh(True)
+
+    def _refresh_nics(self):
+        names = self.store.nic_names()
+        sig = tuple(names)
+        if sig == self._nic_sig:
+            return
+        self._nic_sig = sig
+        vals = ["全部网卡（合计）"] + names
+        cur = self.nic_var.get()
+        self.cb_nic["values"] = vals
+        if cur not in vals:
+            self.nic_var.set(vals[0])
+
+    def _bounds(self):
+        now = time.time()
+        label = self.range_var.get()
+        if label == "自定义时段":
+            a, b = _parse_dt(self.var_start.get()), _parse_dt(self.var_end.get())
+            # 结束时间只写到分钟时，视为该分钟末尾（含 59 秒），避免漏掉当前分钟的点
+            if b is not None and ":" in self.var_end.get() and \
+                    len(self.var_end.get().strip().split(":")) == 2:
+                b += 59
+            if a is None or b is None or b <= a:
+                self.app._toast("自定义时段格式应为 YYYY-MM-DD HH:MM，且结束晚于开始", "err")
+                return now - 3600, now
+            return a, b
+        if label == "今日":
+            lt = time.localtime(now)
+            start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+            return start, now
+        return now - RANGE_SEC.get(label, 3600), now
+
+    def visible(self):
+        try:
+            return bool(self.outer.winfo_ismapped())
+        except Exception:
+            return False
+
+    def refresh_throttled(self, min_gap=1.5):
+        if not self.visible() or not self.expanded:
+            return
+        now = time.time()
+        if now - self._last_refresh >= min_gap:
+            self.refresh()
+
+    def refresh(self, force=False):
+        if not force and (not self.visible() or not self.expanded):
+            return
+        self._last_refresh = time.time()
+        self._refresh_nics()
+        start, end = self._bounds()
+        label = self.nic_var.get()
+        nic = ALL_NIC if label == "全部网卡（合计）" or not label else label
+        res = self.store.query(nic, start, end)
+        self._last = res
+        self.stats["dl"].configure(text=fmt_bytes(res["total_rx"]))
+        self.stats["ul"].configure(text=fmt_bytes(res["total_tx"]))
+        self.stats["pd"].configure(text=fmt_rate(res["peak_rx"]))
+        self.stats["pu"].configure(text=fmt_rate(res["peak_tx"]))
+        self.stats["ad"].configure(text=fmt_rate(res["avg_rx"]))
+        self.stats["au"].configure(text=fmt_rate(res["avg_tx"]))
+        self._draw()
+
+    # ---------- 绘图 ----------
+    def _draw(self):
+        cv = self.cv
+        w, h = cv.winfo_width(), cv.winfo_height()
+        if w < 60 or h < 40:
+            return
+        cv.delete("all")
+        res = self._last or {}
+        pts = res.get("points") or []
+        pad_l, pad_r, pad_t, pad_b = self.px(58), self.px(12), self.px(14), self.px(24)
+        x0, y0 = pad_l, pad_t
+        x1, y1 = w - pad_r, h - pad_b
+        pw, ph = x1 - x0, y1 - y0
+        if not pts:
+            cv.create_text(w / 2, h / 2, text="该时段暂无数据 · 保持程序运行一段时间后自动采集",
+                           fill=MUTED, font=self.fp(11))
+            self._plot = None
+            return
+
+        t0 = min(p[0] for p in pts)
+        t1 = max(p[0] for p in pts)
+        if t1 <= t0:
+            t1 = t0 + 1
+        scale = _nice_rate(max(max(p[1], p[2]) for p in pts))
+
+        # 图区太矮时减少网格线数量，避免刻度文字互相重叠
+        n_div = 4 if ph >= self.px(84) else 2
+        for i in range(n_div + 1):
+            y = y0 + ph * i / n_div
+            cv.create_line(x0, y, x1, y, fill=LINE)
+            cv.create_text(x0 - self.px(6), y, anchor="e",
+                           text=fmt_rate(scale * (1 - i / n_div)), fill=MUTED, font=self.fp(9))
+
+        long_span = (t1 - t0) > 6 * 3600
+        tf = "%m-%d %H:%M" if long_span else "%H:%M"
+        for i in range(5):
+            x = x0 + pw * i / 4
+            cv.create_line(x, y1, x, y1 + self.px(3), fill=LINE)
+            cv.create_text(x, y1 + self.px(6), anchor="n",
+                           text=time.strftime(tf, time.localtime(t0 + (t1 - t0) * i / 4)),
+                           fill=MUTED, font=self.fp(9))
+
+        for idx, color, fill in ((1, DOWN_COLOR, DOWN_FILL), (2, UP_COLOR, UP_FILL)):
+            coords = [x0, y1]
+            for p in pts:
+                xx = x0 + (p[0] - t0) / (t1 - t0) * pw
+                yy = y1 - min(p[idx] / scale, 1.0) * ph
+                coords.extend([xx, yy])
+            coords.extend([x1, y1])
+            cv.create_polygon(coords, fill=fill, outline="")
+            if len(coords) >= 8:
+                cv.create_line(*coords[2:-2], fill=color, width=self.px(2))
+
+        lx, ly = x1 - self.px(6), y0 + self.px(6)
+        for text, color in (("↑ 上行", UP_COLOR), ("↓ 下行", DOWN_COLOR)):
+            cv.create_text(lx, ly, anchor="e", text=text, fill=color, font=self.fp(9, True))
+            ly += self.px(15)
+
+        self._plot = (x0, y0, x1, y1, t0, t1, scale)
+
+    def _on_motion(self, ev):
+        cv = self.cv
+        cv.delete("hover")
+        if not self._plot or not self._last:
+            return
+        x0, y0, x1, y1, t0, t1, _scale = self._plot
+        if not (x0 <= ev.x <= x1 and y0 <= ev.y <= y1):
+            return
+        pts = self._last.get("points") or []
+        if not pts:
+            return
+        target = t0 + (ev.x - x0) / max(x1 - x0, 1) * (t1 - t0)
+        p = min(pts, key=lambda q: abs(q[0] - target))
+        px = x0 + (p[0] - t0) / (t1 - t0) * (x1 - x0)
+        cv.create_line(px, y0, px, y1, fill="#A8B6C6", dash=(3, 3), tags="hover")
+        text = (f"{time.strftime('%H:%M:%S', time.localtime(p[0]))}   "
+                f"↓ {fmt_rate(p[1])}   ↑ {fmt_rate(p[2])}")
+        tw = self.px(8) * len(text) + self.px(12)
+        tx = min(max(px + self.px(8), x0 + self.px(4)), x1 - tw)
+        cv.create_rectangle(tx, y0 + self.px(4), tx + tw, y0 + self.px(24),
+                            fill=CARD, outline=LINE, tags="hover")
+        cv.create_text(tx + tw / 2, y0 + self.px(14), text=text,
+                       fill=TEXT, font=self.fp(10), tags="hover")
+
+    # ---------- 导出 / 清空 ----------
+    def _export(self):
+        start, end = self._bounds()
+        label = self.nic_var.get()
+        nic = ALL_NIC if label == "全部网卡（合计）" or not label else label
+        res = self.store.query(nic, start, end, max_points=1000000)
+        if not res["points"]:
+            self.app._toast("该时段没有可导出的数据", "err")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出流量统计", defaultextension=".csv",
+            initialfile=f"流量统计_{time.strftime('%Y%m%d_%H%M%S')}.csv",
+            filetypes=[("CSV 文件", "*.csv")])
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                f.write("时间,下行速率(B/s),上行速率(B/s)\n")
+                for p in res["points"]:
+                    f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(p[0]))},"
+                            f"{p[1]:.2f},{p[2]:.2f}\n")
+            self.app._toast(f"已导出 {len(res['points'])} 条记录 → {os.path.basename(path)}", "ok")
+        except Exception as e:
+            self.app._toast(f"导出失败：{e}", "err")
+
+    def _clear(self):
+        if not messagebox.askyesno("清空流量历史", "确定清空全部网卡的流量历史吗？此操作不可撤销。"):
+            return
+        self.store.clear()
+        self.store.save(traffic_path(), force=True)
+        self.refresh(True)
+        self.app._toast("流量历史已清空", "ok")
 
 
 class Collector(threading.Thread):
@@ -157,7 +529,9 @@ class Collector(threading.Thread):
                 rates[name] = (0.0, 0.0)
         self._prev_io = io
         self._prev_t = now
-        return {"adapters": adapters, "ports": ports, "rates": rates, "ts": now}
+        io_totals = {name: (c.bytes_recv, c.bytes_sent) for name, c in io.items()}
+        return {"adapters": adapters, "ports": ports, "rates": rates,
+                "io_totals": io_totals, "ts": now}
 
 
 class App:
@@ -191,6 +565,12 @@ class App:
         self._ip_seq = 0
         self.ip_q = queue.Queue()
         self.auto_check = True
+
+        # 流量历史（跨启动持久化）
+        self.traffic = TrafficStore()
+        self.traffic.load(traffic_path())
+        self._traffic_panels = []
+        self._traffic_zoom = None
 
         self.admin = is_admin()
 
@@ -534,6 +914,10 @@ class App:
         self.tv_ad.bind("<<TreeviewSelect>>", self._on_ad_select)
         self.tv_ad.bind("<Button-3>", self._ad_menu)
         self.tv_ad.bind("<Double-1>", lambda e: self.ent_m4.focus_set())
+
+        # 流量统计面板（可折叠 / 可放大）
+        self.traffic_panel = TrafficPanel(tab, self, height=self.px(150))
+        self._traffic_panels.append(self.traffic_panel)
 
         # 跃点数配置卡片
         conf = tk.Frame(tab, bg=CARD, highlightthickness=1, highlightbackground=LINE)
@@ -1140,10 +1524,44 @@ class App:
         self.rates = snap["rates"]
         self.last_ts = snap["ts"]
         self._error_shown = False
+        self.traffic.add(snap["ts"], snap.get("io_totals", {}))
+        self.traffic.save(traffic_path())
+        for panel in list(self._traffic_panels):
+            try:
+                panel.refresh_throttled()
+            except Exception:
+                pass
         self._render_adapters()
         self._render_ports()
         self._update_status()
         self._update_switch_ui()
+
+    def open_traffic_zoom(self):
+        """打开独立的放大窗口，与主面板共享同一份历史数据。"""
+        if self._traffic_zoom is not None:
+            try:
+                if self._traffic_zoom.winfo_exists():
+                    self._traffic_zoom.lift()
+                    return
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        win.title(f"{APP_NAME} · 网卡流量统计")
+        win.configure(bg=BG)
+        win.geometry(f"{self.px(1080)}x{self.px(560)}")
+        win.minsize(self.px(760), self.px(420))
+        self._traffic_zoom = win
+        panel = TrafficPanel(win, self, height=self.px(320), zoom=True)
+        self._traffic_panels.append(panel)
+        win.protocol("WM_DELETE_WINDOW", lambda: self._close_traffic_zoom(win, panel))
+
+    def _close_traffic_zoom(self, win, panel):
+        try:
+            self._traffic_panels.remove(panel)
+        except ValueError:
+            pass
+        self._traffic_zoom = None
+        win.destroy()
 
     def _update_status(self):
         active_ips = sum(1 for a in self.adapters if a["up"] for i in a["ips"] if not i["ip"].startswith("169.254"))
@@ -1380,6 +1798,13 @@ class App:
         self.select_guid = guid
         self._metric_dirty = False
         self._reload_metric_fields(force=True)
+        ad = self._current_adapter()
+        if ad:
+            for panel in list(self._traffic_panels):
+                try:
+                    panel.follow_adapter(ad["name"])
+                except Exception:
+                    pass
 
     def _current_adapter(self):
         if not self.select_guid:
@@ -1754,6 +2179,7 @@ class App:
 
     def _on_close(self):
         self._save_config()
+        self.traffic.save(traffic_path(), force=True)
         try:
             self.collector.stop_evt.set()
         except Exception:

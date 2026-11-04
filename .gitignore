@@ -10,6 +10,10 @@ dist/config.json
 # 运行时配置（含本机网络信息，不入库）
 config.json
 
+# 流量历史数据（本机采集，不入库）
+traffic_history.json
+dist/traffic_history.json
+
 # 编辑器 / 工作区
 .workbuddy/
 .vscode/
